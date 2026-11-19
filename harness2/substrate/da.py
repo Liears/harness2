@@ -240,7 +240,7 @@ class DaClient:
         """
         deadline = time.monotonic() + timeout_s
         last: dict = {}
-        answered = False
+        answers_left = 3
         while True:
             last = self.task_status(task_id)
             state = last.get("state") or last.get("status") or ""
@@ -253,8 +253,9 @@ class DaClient:
                     f"task {task_id} did not reach a terminal state within "
                     f"{timeout_s:.0f}s (last state: {state!r})"
                 )
-            if transcript_dir is not None and not answered:
-                answered = self._answer_pending_ask(task_id, transcript_dir)
+            if transcript_dir is not None and answers_left > 0:
+                if self._answer_pending_ask(task_id, transcript_dir):
+                    answers_left -= 1
             time.sleep(poll_interval_s)
 
     _ASK_USER_STALL_S = 120.0
@@ -264,24 +265,30 @@ class DaClient:
     )
 
     def _answer_pending_ask(self, task_id: str, transcript_dir: Path) -> bool:
-        """Inject the autonomous-decision reply when a rollout is stalled on ask_user."""
+        """Inject the autonomous-decision reply when a rollout is stalled on ask_user.
+
+        Strict gate: the LAST transcript entry must be the pending ask_user
+        call itself and the file must have been quiet for the stall window --
+        an ask_user that was already answered, followed by a long-running tool
+        call, must not be answered again.
+        """
         stream = transcript_dir / f"{task_id}.jsonl"
         try:
             text = stream.read_text(encoding="utf-8", errors="replace")
+            mtime = stream.stat().st_mtime
         except OSError:
             return False
         lines = [ln for ln in text.splitlines() if ln.strip()]
-        if not lines:
-            return False
-        has_ask = '"toolName":"ask_user"' in text or '"toolName": "ask_user"' in text
-        if not has_ask:
+        if not lines or time.time() - mtime <= self._ASK_USER_STALL_S:
             return False
         try:
             last = json.loads(lines[-1])
         except json.JSONDecodeError:
             return False
-        stalled_on_ask = last.get("type") in ("tool_result", "tool_use") and time.time() - stream.stat().st_mtime > self._ASK_USER_STALL_S
-        if not stalled_on_ask:
+        pending_ask = (
+            last.get("type") == "tool_use" and last.get("toolName") == "ask_user"
+        )
+        if not pending_ask:
             return False
         try:
             payload = self._request(
@@ -293,12 +300,6 @@ class DaClient:
         except DaError as e:
             print(f"[da-client] ask_user answer failed on {task_id}: {e}", flush=True)
             return False
-
-    def delete_session(self, session_id: str) -> None:
-        try:
-            self._request("DELETE", f"/api/sessions/{session_id}")
-        except DaError:
-            pass
 
 
 def render_events(

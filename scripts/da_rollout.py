@@ -98,6 +98,14 @@ def snapshot_baseline(workspace: Path) -> None:
 
 
 def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> Path:
+    """One task through DA: workspace -> session -> rollout -> run_dir.
+
+    The DA session and its transcript are deliberately NOT deleted afterwards:
+    deletion cascades agent_tasks away and erases on-disk transcripts mid-batch
+    (observed: an interrupted model restart turned four in-flight rollouts into
+    errors whose cleanup wiped the whole session table). da-meta.json records
+    the sessionId so a run stays inspectable on the DA side.
+    """
     task_dir = dataset / task_id
     if not task_dir.is_dir():
         raise FileNotFoundError(f"unknown task: {task_dir}")
@@ -117,68 +125,60 @@ def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> P
     if workspace.exists():
         shutil.rmtree(workspace)
     client = DaClient()
-    session_id = ""
+    _log(f"preparing workspace from {task_dir.name}")
+    prepare_workspace(task_dir, workspace)
+    snapshot_baseline(workspace)
+    _log(f"workspace ready: {workspace}")
+
+    project_id = client.find_project(workspace) or client.create_project(workspace)
+    session_id = client.create_session(f"wb-code {task_id}")
     try:
-        _log(f"preparing workspace from {task_dir.name}")
-        prepare_workspace(task_dir, workspace)
-        snapshot_baseline(workspace)
-        _log(f"workspace ready: {workspace}")
+        client.bind_workspace(session_id, project_id)
+    except DaError as e:
+        # A stable per-task path gets rm -rf'ed and rebuilt between runs,
+        # which changes the directory inode DA's project row recorded
+        # (pathKey). Re-register the project and bind again.
+        if "PROJECT_DIRECTORY_CHANGED" not in str(e):
+            raise
+        _log("project pathKey stale after workspace rebuild; re-registering")
+        client.remove_project(project_id)
+        project_id = client.create_project(workspace)
+        client.bind_workspace(session_id, project_id)
+    _log(f"session {session_id} bound to project {project_id}")
 
-        project_id = client.find_project(workspace) or client.create_project(workspace)
-        session_id = client.create_session(f"wb-code {task_id}")
-        try:
-            client.bind_workspace(session_id, project_id)
-        except DaError as e:
-            # A stable per-task path gets rm -rf'ed and rebuilt between runs,
-            # which changes the directory inode DA's project row recorded
-            # (pathKey). Re-register the project and bind again.
-            if "PROJECT_DIRECTORY_CHANGED" not in str(e):
-                raise
-            _log("project pathKey stale after workspace rebuild; re-registering")
-            client.remove_project(project_id)
-            project_id = client.create_project(workspace)
-            client.bind_workspace(session_id, project_id)
-        _log(f"session {session_id} bound to project {project_id}")
+    _log(f"dispatching task (timeout {timeout_s}s)")
+    task_api_id = client.run_async(session_id, instruction)
+    transcript_dir = (
+        Path(DA_DATA_DIR) / "sessions" / session_id / "transcripts" if DA_DATA_DIR else None
+    )
+    result = client.wait_for_task(task_api_id, timeout_s=timeout_s, transcript_dir=transcript_dir)
+    _log(f"task finished: status={result.status} turns={result.turns}")
 
-        _log(f"dispatching task (timeout {timeout_s}s)")
-        task_api_id = client.run_async(session_id, instruction)
-        transcript_dir = (
-            Path(DA_DATA_DIR) / "sessions" / session_id / "transcripts" if DA_DATA_DIR else None
-        )
-        result = client.wait_for_task(task_api_id, timeout_s=timeout_s, transcript_dir=transcript_dir)
-        _log(f"task finished: status={result.status} turns={result.turns}")
+    entries = client.transcript(session_id)
+    stream = run_dir / "agent" / "da-output.jsonl"
+    with stream.open("w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    _log(f"trajectory: {len(entries)} entries -> {stream}")
 
-        entries = client.transcript(session_id)
-        stream = run_dir / "agent" / "da-output.jsonl"
-        with stream.open("w", encoding="utf-8") as fh:
-            for entry in entries:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        _log(f"trajectory: {len(entries)} entries -> {stream}")
+    patch = workspace_diff(workspace)
+    (run_dir / "verifier" / "agent.patch").write_text(patch, encoding="utf-8")
+    _log(f"agent.patch: {len(patch)} bytes")
 
-        patch = workspace_diff(workspace)
-        (run_dir / "verifier" / "agent.patch").write_text(patch, encoding="utf-8")
-        _log(f"agent.patch: {len(patch)} bytes")
-
-        meta = {
-            "task": task_id,
-            "sessionId": session_id,
-            "taskId": task_api_id,
-            "status": result.status,
-            "turns": result.turns,
-            "output": result.output[:2000],
-        }
-        (run_dir / "da-meta.json").write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        if result.status not in ("complete", "completed"):
-            _log(f"WARNING: non-complete status {result.status!r}; patch may be empty")
-        return run_dir
-    finally:
-        # The session and its transcript stay on the DA side for traceability:
-        # deleting them here cascades agent_tasks away and erases the on-disk
-        # transcript mid-batch (observed: an interrupted model restart turned
-        # four in-flight rollouts into errors, whose cleanup wiped the DB).
-        pass
+    meta = {
+        "task": task_id,
+        "sessionId": session_id,
+        "taskId": task_api_id,
+        "status": result.status,
+        "turns": result.turns,
+        "output": result.output[:2000],
+    }
+    (run_dir / "da-meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if result.status not in ("complete", "completed"):
+        _log(f"WARNING: non-complete status {result.status!r}; patch may be empty")
+    return run_dir
 
 
 def main(argv: list[str] | None = None) -> int:

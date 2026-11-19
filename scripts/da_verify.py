@@ -2,17 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Score one DA-produced run_dir against a WorkBuddy-Bench code task.
 
-Mirrors the dataset's host-side verifier contract (pytest_injected family):
+Mirrors the dataset's own verifier contract, for both families it ships:
 
-    1. build the task's own ``environment/`` image (deps baked in)
-    2. run one container: apply the agent patch to the pristine workspace,
-       inject the task's tests, run the ``verifier.toml`` pytest command
-    3. feed the JUnit XML + patches to the task's baked-in ``scorer.py``
-    4. write ``<run_dir>/verifier/score.json`` (harness2 reads
-       reward > overall > test_pass_rate > tests_passed/tests_total)
+    pytest_injected  build the task's ``environment/`` image, apply the agent
+                     patch to the pristine workspace, inject ``tests/injected``
+                     and run the ``verifier.toml`` pytest command, then feed
+                     the JUnit XML to the baked-in ``scorer.py``
+    script_verifier  same build and patch step, then run the task's own
+                     ``tests/verifier.py``, which writes reward.json
+
+Either way the cell ends with ``<run_dir>/verifier/score.json`` carrying the
+fields harness2's reader understands (reward > overall > test_pass_rate >
+tests_passed/tests_total).
 
 Usage:
-    python3 scripts/da_verify.py <task-id> [--run-dir DIR] [--dataset DIR]
+    .venv/bin/python scripts/da_verify.py <task-id> [--run-dir DIR] [--dataset DIR]
 
 The run_dir is what scripts/da_rollout.py produced (verifier/agent.patch).
 """
@@ -26,6 +30,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -87,17 +92,28 @@ def verify_one(task_id: str, *, run_dir: Path, dataset: Path) -> float | None:
         raise ValueError(f"{task_dir}/tests/verifier.toml: unsupported family {family!r}")
 
     image = f"da-verify/{task_id.lower().replace('_', '-')}"
-    context = build_context(task_dir, run_dir / "build-context")
-    build = _run(
-        ["docker", "build", "-t", image, str(context)],
-        capture_output=True, text=True,
-    )
-    if build.returncode != 0:
-        raise RuntimeError(f"docker build failed:\n{build.stderr[-2000:]}")
+    # The build context lives in a temp dir, never in the run_dir: the task
+    # environment carries a ~200MB workspace archive and a successful build
+    # leaves nothing worth keeping there.
+    context_root = Path(tempfile.mkdtemp(prefix=f"da-verify-{task_id[:24]}-"))
+    try:
+        context = build_context(task_dir, context_root / "ctx")
+        build = _run(
+            ["docker", "build", "-t", image, str(context)],
+            capture_output=True, text=True,
+        )
+        if build.returncode != 0:
+            raise RuntimeError(f"docker build failed:\n{build.stderr[-2000:]}")
+    finally:
+        shutil.rmtree(context_root, ignore_errors=True)
     _log(f"image built: {image}")
 
     score_json = run_dir / "verifier" / "score.json"
     score_json.parent.mkdir(parents=True, exist_ok=True)
+    # A stale cell must never be read back as this run's verdict: clear every
+    # output the verifier is about to (re)write.
+    for stale in ("score.json", "reward.json", "reward.txt", "results.xml", "test_output.txt"):
+        (score_json.parent / stale).unlink(missing_ok=True)
     if family == "script_verifier":
         # The task ships its own tests/verifier.py: import the patched workspace
         # and write reward.json (same fields harness2's score reader expects)

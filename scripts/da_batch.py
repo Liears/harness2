@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batch baseline smoke: N WorkBuddy-Bench code tasks through DA, then verify.
 
-Runs rollouts with a bounded thread pool (default 4, matching the measured
-throughput sweet spot on the local model), then judges each run dir, and
-prints a summary table. Idempotent per stage: finished run dirs keep their
-patch (rerun skips them unless --force), judge failures are recorded as
-unscored, never as zero.
+Runs rollouts with a bounded thread pool, then judges each run dir and prints a
+summary table. Every run_dir is rebuilt from scratch (each rollout gets a fresh
+workspace), so a rerun re-executes the tasks rather than reusing old patches.
+A rollout or judge failure is recorded as such and never laundered into a 0
+score -- an unscored task stays unscored in the summary.
 
 Usage:
     .venv/bin/python scripts/da_batch.py [task-id ...] [--n 10] [--jobs 4] \
@@ -85,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{tid:55s} {'FAILED' if not r['ok'] else ('unscored' if mark is None else f'{mark:.3f}')}")
     if scored:
         print(f"\nmean={sum(scored) / len(scored):.3f}  scored={len(scored)}/{len(task_ids)}")
+    args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "summary.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
     )
