@@ -50,6 +50,9 @@ from .base import Install, RunRequest
 
 DA_BASE_URL = os.environ.get("HARNESS2_DA_BASE_URL", "http://127.0.0.1:21000")
 DA_MODE = os.environ.get("HARNESS2_DA_MODE", "code-it")
+# Root of DA's session data (contains sessions/<id>/transcripts/<taskId>.jsonl).
+# Only needed for the unattended ask_user guard; empty disables the guard.
+DA_DATA_DIR = os.environ.get("HARNESS2_DA_DATA_DIR", "")
 
 DA_SURFACE = SurfaceSpec(
     name="da",
@@ -213,11 +216,24 @@ class DaClient:
         return [e for e in entries if isinstance(e, dict)]
 
     def wait_for_task(
-        self, task_id: str, *, timeout_s: float, poll_interval_s: float = _POLL_INTERVAL_S
+        self,
+        task_id: str,
+        *,
+        timeout_s: float,
+        poll_interval_s: float = _POLL_INTERVAL_S,
+        transcript_dir: Path | None = None,
     ) -> DaRolloutResult:
-        """Poll a run-async task to a terminal state (complete/error/cancelled)."""
+        """Poll a run-async task to a terminal state (complete/error/cancelled).
+
+        Unattended guard: benchmark runs have no human to answer `ask_user`.
+        When a transcript dir is supplied, a pending `ask_user` call that has
+        seen no follow-up events for a couple of minutes is answered once with
+        an "decide autonomously" reply, so the rollout cannot stall forever
+        on a question (DA's ask_user waits indefinitely by design).
+        """
         deadline = time.monotonic() + timeout_s
         last: dict = {}
+        answered = False
         while True:
             last = self.task_status(task_id)
             state = last.get("state") or last.get("status") or ""
@@ -230,7 +246,46 @@ class DaClient:
                     f"task {task_id} did not reach a terminal state within "
                     f"{timeout_s:.0f}s (last state: {state!r})"
                 )
+            if transcript_dir is not None and not answered:
+                answered = self._answer_pending_ask(task_id, transcript_dir)
             time.sleep(poll_interval_s)
+
+    _ASK_USER_STALL_S = 120.0
+    _ASK_USER_REPLY = (
+        "这是无人值守的评测运行，请不要再提问：由你自主选择最合理、改动最保守且能"
+        "通过现有测试的方案继续完成并交付。"
+    )
+
+    def _answer_pending_ask(self, task_id: str, transcript_dir: Path) -> bool:
+        """Inject the autonomous-decision reply when a rollout is stalled on ask_user."""
+        stream = transcript_dir / f"{task_id}.jsonl"
+        try:
+            text = stream.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return False
+        has_ask = '"toolName":"ask_user"' in text or '"toolName": "ask_user"' in text
+        if not has_ask:
+            return False
+        try:
+            last = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return False
+        stalled_on_ask = last.get("type") in ("tool_result", "tool_use") and time.time() - stream.stat().st_mtime > self._ASK_USER_STALL_S
+        if not stalled_on_ask:
+            return False
+        try:
+            payload = self._request(
+                "POST", f"/api/agents/inject/{task_id}", body={"message": self._ASK_USER_REPLY}
+            )
+            status = payload.get("status") if isinstance(payload, dict) else None
+            print(f"[da-client] answered pending ask_user on {task_id} ({status})", flush=True)
+            return True
+        except DaError as e:
+            print(f"[da-client] ask_user answer failed on {task_id}: {e}", flush=True)
+            return False
 
     def delete_session(self, session_id: str) -> None:
         try:

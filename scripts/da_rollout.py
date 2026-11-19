@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from harness2.substrate.da import DA_MODE, DaClient, DaError  # noqa: E402
+from harness2.substrate.da import DA_DATA_DIR, DA_MODE, DaClient, DaError  # noqa: E402
 
 WB_REPO = Path(__file__).resolve().parents[1] / "dependencies" / "workbuddy-bench"
 DEFAULT_DATASET = WB_REPO / "datasets" / "wb-bench-code-v1.0" / "tasks"
@@ -120,7 +120,10 @@ def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> P
 
         _log(f"dispatching task (timeout {timeout_s}s)")
         task_api_id = client.run_async(session_id, instruction)
-        result = client.wait_for_task(task_api_id, timeout_s=timeout_s)
+        transcript_dir = (
+            Path(DA_DATA_DIR) / "sessions" / session_id / "transcripts" if DA_DATA_DIR else None
+        )
+        result = client.wait_for_task(task_api_id, timeout_s=timeout_s, transcript_dir=transcript_dir)
         _log(f"task finished: status={result.status} turns={result.turns}")
 
         entries = client.transcript(session_id)
@@ -149,12 +152,11 @@ def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> P
             _log(f"WARNING: non-complete status {result.status!r}; patch may be empty")
         return run_dir
     finally:
-        try:
-            if session_id:
-                client.delete_session(session_id)
-        except DaError:
-            pass
-        # keep the workspace for post-mortem; caller sweeps run roots separately
+        # The session and its transcript stay on the DA side for traceability:
+        # deleting them here cascades agent_tasks away and erases the on-disk
+        # transcript mid-batch (observed: an interrupted model restart turned
+        # four in-flight rollouts into errors, whose cleanup wiped the DB).
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
