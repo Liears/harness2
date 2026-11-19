@@ -182,6 +182,13 @@ class DaClient:
                         return pid
         return None
 
+    def remove_project(self, project_id: str) -> None:
+        try:
+            self._request("DELETE", f"/api/projects/{project_id}")
+        except DaError as e:
+            if "404" not in str(e):
+                raise
+
     def bind_workspace(self, session_id: str, project_id: str) -> None:
         self._request(
             "POST",

@@ -73,17 +73,28 @@ def workspace_diff(workspace: Path) -> str:
 
 
 def snapshot_baseline(workspace: Path) -> None:
-    """Commit the pristine workspace so the agent's edits show up as a diff."""
+    """Commit the pristine workspace so the agent's edits show up as a diff.
+
+    Also pins ignore rules for interpreter caches: the agent runs the repo's
+    tests while solving, and the resulting __pycache__/*.pyc must never enter
+    the diff (observed: binary hunks in agent.patch made the whole patch fail
+    to apply on the verifier's pristine copy).
+    """
+    gi = workspace / ".gitignore"
+    rules = gi.read_text(encoding="utf-8") if gi.is_file() else ""
+    add = [r for r in ("__pycache__/", "*.pyc", ".pytest_cache/") if r not in rules]
+    if add:
+        gi.write_text(rules + ("\n" if rules and not rules.endswith("\n") else "") + "\n".join(add) + "\n", encoding="utf-8")
     git = ["git", "-C", str(workspace)]
     base = subprocess.run(git + ["rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
     if base.returncode != 0:
         subprocess.run(git + ["init", "-q"], check=True)
-        subprocess.run(git + ["add", "-A"], check=True)
-        subprocess.run(
-            git + ["-c", "user.email=baseline@local", "-c", "user.name=baseline",
-                   "commit", "-q", "-m", "baseline"],
-            check=True,
-        )
+    subprocess.run(git + ["add", "-A"], check=True)
+    subprocess.run(
+        git + ["-c", "user.email=baseline@local", "-c", "user.name=baseline",
+               "commit", "-q", "-m", "baseline"],
+        check=True,
+    )
 
 
 def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> Path:
@@ -115,7 +126,18 @@ def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> P
 
         project_id = client.find_project(workspace) or client.create_project(workspace)
         session_id = client.create_session(f"wb-code {task_id}")
-        client.bind_workspace(session_id, project_id)
+        try:
+            client.bind_workspace(session_id, project_id)
+        except DaError as e:
+            # A stable per-task path gets rm -rf'ed and rebuilt between runs,
+            # which changes the directory inode DA's project row recorded
+            # (pathKey). Re-register the project and bind again.
+            if "PROJECT_DIRECTORY_CHANGED" not in str(e):
+                raise
+            _log("project pathKey stale after workspace rebuild; re-registering")
+            client.remove_project(project_id)
+            project_id = client.create_project(workspace)
+            client.bind_workspace(session_id, project_id)
         _log(f"session {session_id} bound to project {project_id}")
 
         _log(f"dispatching task (timeout {timeout_s}s)")

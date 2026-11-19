@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -29,6 +31,9 @@ from pathlib import Path
 
 WB_REPO = Path(__file__).resolve().parents[1] / "dependencies" / "workbuddy-bench"
 DEFAULT_DATASET = WB_REPO / "datasets" / "wb-bench-code-v1.0" / "tasks"
+# Direct pypi.org streams stall on this network; the same packages from a
+# mirror keep the task's own Dockerfile semantics (only the index differs).
+PIP_INDEX = "https://mirrors.aliyun.com/pypi/simple"
 
 
 def _log(msg: str) -> None:
@@ -40,6 +45,29 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kwargs)
 
 
+def build_context(task_dir: Path, build_dir: Path) -> Path:
+    """Copy the task environment and point its pip installs at a mirror.
+
+    The task's Dockerfile installs the repo's real dependencies; rewriting
+    only the index URL changes where identical packages are downloaded from,
+    not what gets installed or how the verifier behaves.
+    """
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    shutil.copytree(task_dir / "environment", build_dir)
+    dockerfile = build_dir / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    patched = re.sub(
+        r"(python -m pip install|(?<![a-z])pip install)(?! -i\b)",
+        rf"\1 -i {PIP_INDEX}",
+        text,
+    )
+    if patched != text:
+        dockerfile.write_text(patched, encoding="utf-8")
+        _log("pip installs routed through mirror index (identical packages)")
+    return build_dir
+
+
 def verify_one(task_id: str, *, run_dir: Path, dataset: Path) -> float | None:
     task_dir = dataset / task_id
     if not task_dir.is_dir():
@@ -49,15 +77,19 @@ def verify_one(task_id: str, *, run_dir: Path, dataset: Path) -> float | None:
         raise FileNotFoundError(f"missing agent.patch: {patch}")
 
     verifier_toml = tomllib.loads((task_dir / "tests" / "verifier.toml").read_text("utf-8"))
+    family = verifier_toml.get("family", "pytest_injected")
     run_cfg = verifier_toml.get("run", {})
     pytest_cmd = run_cfg.get("command")
     cwd = run_cfg.get("cwd", "/workspace")
-    if not isinstance(pytest_cmd, str) or not pytest_cmd.strip():
+    if family == "pytest_injected" and (not isinstance(pytest_cmd, str) or not pytest_cmd.strip()):
         raise ValueError(f"{task_dir}/tests/verifier.toml has no run.command")
+    if family not in ("pytest_injected", "script_verifier"):
+        raise ValueError(f"{task_dir}/tests/verifier.toml: unsupported family {family!r}")
 
     image = f"da-verify/{task_id.lower().replace('_', '-')}"
+    context = build_context(task_dir, run_dir / "build-context")
     build = _run(
-        ["docker", "build", "-t", image, str(task_dir / "environment")],
+        ["docker", "build", "-t", image, str(context)],
         capture_output=True, text=True,
     )
     if build.returncode != 0:
@@ -66,7 +98,34 @@ def verify_one(task_id: str, *, run_dir: Path, dataset: Path) -> float | None:
 
     score_json = run_dir / "verifier" / "score.json"
     score_json.parent.mkdir(parents=True, exist_ok=True)
-    script = f"""
+    if family == "script_verifier":
+        # The task ships its own tests/verifier.py: import the patched workspace
+        # and write reward.json (same fields harness2's score reader expects)
+        # into LOG_DIR. No injected tests, no baked scorer.
+        script = f"""
+set -uo pipefail
+cd {shlex.quote(cwd)}
+if ! git apply --whitespace=nowarn /tmp/agent.patch; then
+  echo "patch application failed" > /logs/verifier/test_output.txt
+  printf '{{"overall": 0.0, "test_status": "patch_failed", "tests_total": 1, "tests_passed": 0}}' > /logs/verifier/reward.json
+  exit 0
+fi
+python /tmp/verifier.py
+"""
+        _run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{(run_dir / 'verifier').resolve()}:/logs/verifier",
+                "-v", f"{patch.resolve()}:/tmp/agent.patch:ro",
+                "-v", f"{(task_dir / 'tests' / 'verifier.py').resolve()}:/tmp/verifier.py:ro",
+                image, "bash", "-c", script,
+            ],
+        )
+        reward = run_dir / "verifier" / "reward.json"
+        if reward.is_file():
+            shutil.copy(reward, score_json)
+    else:
+        script = f"""
 set -uo pipefail
 cd {shlex.quote(cwd)}
 if ! git apply --whitespace=nowarn /tmp/agent.patch; then
@@ -81,16 +140,16 @@ cp -r /tmp/injected/. tests/
 python /scorer/scorer.py --agent-patch /tmp/agent.patch --gold-patch /tmp/gold.patch \
   --junit-xml /logs/verifier/results.xml --output /logs/verifier/score.json
 """
-    _run(
-        [
-            "docker", "run", "--rm",
-            "-v", f"{(run_dir / 'verifier').resolve()}:/logs/verifier",
-            "-v", f"{patch.resolve()}:/tmp/agent.patch:ro",
-            "-v", f"{(task_dir / 'tests' / 'gold.patch').resolve()}:/tmp/gold.patch:ro",
-            "-v", f"{(task_dir / 'tests' / 'injected' / 'tests').resolve()}:/tmp/injected:ro",
-            image, "bash", "-c", script,
-        ],
-    )
+        _run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{(run_dir / 'verifier').resolve()}:/logs/verifier",
+                "-v", f"{patch.resolve()}:/tmp/agent.patch:ro",
+                "-v", f"{(task_dir / 'tests' / 'gold.patch').resolve()}:/tmp/gold.patch:ro",
+                "-v", f"{(task_dir / 'tests' / 'injected' / 'tests').resolve()}:/tmp/injected:ro",
+                image, "bash", "-c", script,
+            ],
+        )
     if not score_json.is_file():
         raise RuntimeError(f"verifier produced no score.json in {run_dir}")
     payload = json.loads(score_json.read_text("utf-8"))
