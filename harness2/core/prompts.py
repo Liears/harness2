@@ -193,6 +193,70 @@ Then reply with ONE `<notes>` block and nothing else: for each change, the momen
 trajectory that motivated it. The notes are read by a person, not applied by a machine."""
 
 
+_SURFACE_DA = """\
+# WHAT YOU CAN CHANGE
+
+The harness is a tree of components DeepAnalyze (DA) loads through its own
+mechanisms. Each has a different runtime cost and a different reach:
+
+| path | what it is | when it is in context |
+|---|---|---|
+| `AGENTS.md` | role, procedure, rules, durable facts | ALWAYS ON -- injected at the system tail from the session workspace; every token competes with the agent's own output budget |
+| `skills/<name>/SKILL.md` | a reusable workflow | name+description advertised in DA's available-skills block; the BODY is read ON DEMAND via skill_invoke |
+| `skills/<name>/scripts/*` | a helper carried with its skill | run via bash |
+| `scripts/<name>.py` | a deterministic helper | run on demand via bash |
+
+DA has no runtime sub-agent registration and no plugin channel on this surface:
+do not write `sub_agents/` or `plugin/` files, they would not execute.
+
+The two that are easy to get wrong:
+
+`skills/` -- a skill is installed through DA's agent_skills table with a name
+and a description. Only name and description are shown up front -- a skill never
+NAMED in `AGENTS.md` as a trigger is never invoked, so it is pure dead weight.
+If a skill calls a helper, that helper must travel with it inside the skill
+directory.
+
+`AGENTS.md` is DA's ONLY always-on channel. DA's own mode preset supplies the
+agent's identity and tool descriptions from code you cannot edit here; what you
+write in `AGENTS.md` rides on top as workspace-level project instructions. It
+is where role, procedure, rules, durable facts and tool-usage discipline go.
+
+ALWAYS-ON PROSE IS THE EXPENSIVE OPTION. Every word of it is in context on every
+run, competing with the agent's own output budget. An on-demand skill or script
+costs nothing until invoked, so prefer those for anything with a recognisable
+trigger or a deterministic operation the runs hand-rolled and got wrong.
+
+`AGENTS.md` MUST NEVER BE LEFT EMPTY OR DELETED -- it is the only always-on file
+on this surface, so a harness without it carries no standing instruction and is
+rejected before any rollout. To pay for a new rule, TRIM it, never empty it.
+
+A skill only exists if the agent knows to call it: its literal name must appear
+in `AGENTS.md` as a trigger, or it is dead weight.
+
+THE DELIVERABLE'S SHAPE BELONGS TO THE REQUEST, NOT TO YOU. A harness changes HOW
+the agent works; it must never change WHAT SHAPE it delivers. Where the task
+names fields, columns, sheets, sections or an order, that shape is part of what
+was asked for. Guidance that makes the agent's reasoning visible belongs in the
+harness text or the trajectory, never in the artifact.
+
+# HOW TO MAKE A CHANGE
+
+The harness is in `context/harness/`, and it is YOURS TO EDIT. Open the files,
+change them in place with your normal tools, and create new ones where a new
+component is the right lever. Your edits on disk ARE the proposal.
+
+- Files you do not touch are inherited unchanged. Do not rewrite a file to keep
+  it the same.
+- Delete a file to remove that component.
+- If the evidence does not argue for any change, leave everything as it is and
+  say KEEP_BASE in your notes. That is a real answer, not a failure.
+
+Then reply with ONE `<notes>` block and nothing else: for each change, the moment
+in a trajectory that motivated it. The notes are read by a person, not applied
+by a machine."""
+
+
 _SURFACE_CODEX = """\
 # WHAT YOU CAN CHANGE
 
@@ -629,6 +693,12 @@ def _build_surface_texts() -> dict[str, _SurfaceText]:
             _surface_part(_SURFACE_CODEX, "# HOW TO MAKE A CHANGE"),
         ]
     )
+    da_tts = "\n\n".join(
+        [
+            _surface_part(_SURFACE_DA, "ALWAYS-ON PROSE", "THE DELIVERABLE'S SHAPE"),
+            _surface_part(_SURFACE_DA, "# HOW TO MAKE A CHANGE"),
+        ]
+    )
     return {
         "opencode": _SurfaceText(
             surface_md=_SURFACE_OPENCODE,
@@ -657,6 +727,20 @@ def _build_surface_texts() -> dict[str, _SurfaceText]:
                 "that trigger line in the same edit.",
             ),
             tts_surface=cx_tts,
+        ),
+        "da": _SurfaceText(
+            surface_md=_SURFACE_DA,
+            inv=_INV_TEMPLATE.replace(
+                "__LOOP_LEVER__",
+                "a deterministic rule in `AGENTS.md` -- for example, requiring the agent "
+                "to run the tests and quote the output before finishing",
+            ),
+            dom=_DOM_TEMPLATE.replace(
+                "__TRIGGER_SENTENCE__",
+                "A skill exists only once its name appears in `AGENTS.md` as a trigger: write "
+                "that trigger line in the same edit.",
+            ),
+            tts_surface=da_tts,
         ),
     }
 

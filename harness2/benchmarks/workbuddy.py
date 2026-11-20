@@ -852,7 +852,10 @@ class WbAdapter:
                     task_id,
                     dataset=SUBSETS[self.subset].tasks_dir,
                     out_root=trial / "_run",
-                    timeout_s=timeout or 1800,
+                    # DA shares the model endpoint with any other work on the
+                    # host; a 30-minute wall clock is too tight when several
+                    # rollouts run in parallel. Give DA its own floor.
+                    timeout_s=timeout or 3600,
                     harness=ws,
                 )
                 # da_rollout writes <out_root>/<task>/...; hoist it up one level

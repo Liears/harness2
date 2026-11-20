@@ -43,10 +43,13 @@ def check(adapter, *, judge=False) -> list[str]:
             errors.append(f"{label}: {type(exc).__name__}; see README.md")
             return False
 
+    is_da = getattr(getattr(adapter, "substrate", None), "name", "") == "da"
     for validate in (
-        lambda: config.validate_models(judge=judge),
+        # DA resolves its model from its own provider table, so the OpenCode
+        # solver/improver model requirements do not apply on this path.
+        (lambda: config.validate_models(judge=judge)) if not is_da else (lambda: None),
         adapter.tasks,
-        OpencodeSubstrate().preflight,
+        OpencodeSubstrate().preflight if not is_da else (lambda: None),
         adapter.preflight,
     ):
         try:
@@ -76,9 +79,12 @@ def check(adapter, *, judge=False) -> list[str]:
     if not (config.OPENCODE_DIR / "node_modules").is_dir():
         errors.append(f"OpenCode dependencies missing; run harness2-setup {bench}")
 
-    if any(
-        m.startswith("google-vertex") for m in (config.SOLVER_MODEL_OC, config.IMPROVER_MODEL)
-    ) or (judge and (bench == "wb" or config.JUDGE_MODEL.startswith(("claude", "gemini")))):
+    if not is_da and (
+        any(
+            m.startswith("google-vertex") for m in (config.SOLVER_MODEL_OC, config.IMPROVER_MODEL)
+        )
+        or (judge and (bench == "wb" or config.JUDGE_MODEL.startswith(("claude", "gemini"))))
+    ):
         probe(
             "Google Application Default Credentials",
             ["gcloud", "auth", "application-default", "print-access-token"],
@@ -121,26 +127,27 @@ def check(adapter, *, judge=False) -> list[str]:
                 [config.WB_RENDER_PY, "-c", "import openpyxl, pptx"],
                 remedy="install 'harness2[render]' in the main environment",
             )
-        probe(
-            "WorkBuddy runtime",
-            [
-                repo / ".venv/bin/python",
-                "-c",
-                "import harbor; from workbuddy_bench.runner.harness_adapters import HARNESS_ADAPTERS; "
-                "assert all(k in HARNESS_ADAPTERS for k in ('opencode', 'oc-harness', 'codex-harness'))",
-            ],
-            cwd=repo,
-        )
-        for role, expected in (
-            ("solver", config.SOLVER_MODEL_OC.removeprefix("google-vertex/")),
-            ("judge", config.JUDGE_MODEL),
-        ):
-            path = repo / "configs/models/harness2" / f"{role}.yaml"
-            try:
-                if json.loads(path.read_text())["model"]["name"] != "google/" + expected:
-                    errors.append(f"WorkBuddy {role} configuration is stale; rerun setup")
-            except (OSError, ValueError, KeyError, TypeError):
-                errors.append(f"WorkBuddy {role} configuration missing; rerun setup")
+        if not is_da:
+            probe(
+                "WorkBuddy runtime",
+                [
+                    repo / ".venv/bin/python",
+                    "-c",
+                    "import harbor; from workbuddy_bench.runner.harness_adapters import HARNESS_ADAPTERS; "
+                    "assert all(k in HARNESS_ADAPTERS for k in ('opencode', 'oc-harness', 'codex-harness'))",
+                ],
+                cwd=repo,
+            )
+            for role, expected in (
+                ("solver", config.SOLVER_MODEL_OC.removeprefix("google-vertex/")),
+                ("judge", config.JUDGE_MODEL),
+            ):
+                path = repo / "configs/models/harness2" / f"{role}.yaml"
+                try:
+                    if json.loads(path.read_text())["model"]["name"] != "google/" + expected:
+                        errors.append(f"WorkBuddy {role} configuration is stale; rerun setup")
+                except (OSError, ValueError, KeyError, TypeError):
+                    errors.append(f"WorkBuddy {role} configuration missing; rerun setup")
     return errors
 
 
