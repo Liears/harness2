@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -48,7 +49,7 @@ from . import wb_render as RENDER
 from .tasks import discover, select
 
 SCOREABLE = frozenset({"code", "web", "office"})
-SUBSTRATES = ("oc", "cx")
+SUBSTRATES = ("oc", "cx", "da")
 
 _BASE_LOCK = threading.Lock()
 _BASE_DONE: set[Path] = set()
@@ -653,10 +654,13 @@ def run_batch(
 def spec_for(subset: str, substrate: str) -> BenchSpec:
     s = SUBSETS[subset]
     channel = resolve_channel_model(None, None, effort="high")
+    install_mode = {"oc": "home_dir_jinja", "cx": "codex_root", "da": "workspace_agents_md"}[
+        substrate
+    ]
     return BenchSpec(
         name=f"wb-{subset}",
         runs_root=config.RUNS / "wb" / subset,
-        install_mode="home_dir_jinja" if substrate == "oc" else "codex_root",
+        install_mode=install_mode,
         prompts=workbuddy_prompts(subset),
         channels={"proposer": channel, "selector": channel},
         domain_word="category",
@@ -682,11 +686,14 @@ class WbAdapter:
         self.subset = subset
         self.subset_info = SUBSETS[subset]
         self.spec = spec_for(subset, substrate)
-        self.substrate = (
-            OpencodeSubstrate(launcher=self._launch)
-            if substrate == "oc"
-            else CodexSubstrate(launcher=self._launch)
-        )
+        if substrate == "oc":
+            self.substrate = OpencodeSubstrate(launcher=self._launch)
+        elif substrate == "cx":
+            self.substrate = CodexSubstrate(launcher=self._launch)
+        else:
+            from ..substrate.da import DaSubstrate
+
+            self.substrate = DaSubstrate(launcher=self._launch)
 
     def tasks(self, split: str = "all") -> list[str]:
         return select(
@@ -737,6 +744,13 @@ class WbAdapter:
 
     def _cell_identity(self) -> dict:
         """What makes two rollouts of one label the same rollout, beyond the harness."""
+        if self.substrate.name == "da":
+            from ..substrate.da import DA_BASE_URL, DA_MODE
+
+            return {
+                "solver": f"da:{DA_MODE}",
+                "endpoint": DA_BASE_URL,
+            }
         return {
             "solver": config.SOLVER_MODEL_OC
             if self.substrate.name == "oc"
@@ -787,6 +801,13 @@ class WbAdapter:
                 and self._identity_matches(t)
             )
 
+        if self.substrate.name == "da":
+            # DA rollouts run on the host against the service's own HTTP API;
+            # each one also runs the task's verifier, because a trial is only
+            # reusable once verifier/score.json exists.
+            fresh = self._da_launch_batch(req.task_ref, label, ws, k, req.timeout)
+            return self._rank(fresh)
+
         new_dirs = run_batch(
             self.subset_info,
             self.substrate.name,
@@ -801,6 +822,51 @@ class WbAdapter:
         )
         fresh = [t for t in _trials_in(new_dirs, req.task_ref, self.subset) if _trial_finished(t)]
         return self._rank(fresh)
+
+    def _da_launch_batch(
+        self, task_id: str, label: str, ws: Path | None, k: int, timeout: int
+    ) -> list[Path]:
+        """Drive k DA rollouts (each followed by its verifier) under `label`."""
+        import concurrent.futures as _cf
+
+        from scripts.da_rollout import run_one as _da_run_one
+        from scripts.da_verify import verify_one as _da_verify_one
+
+        label_dir = self._label_dir(label)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trials: list[Path] = []
+
+        def _one(idx: int) -> Path | None:
+            trial = label_dir / f"{task_id}__da{idx:02d}-{stamp}"
+            trial.mkdir(parents=True, exist_ok=True)
+            try:
+                run_dir = _da_run_one(
+                    task_id,
+                    dataset=SUBSETS[self.subset].tasks_dir,
+                    out_root=trial / "_run",
+                    timeout_s=timeout or 1800,
+                    harness=ws,
+                )
+                # da_rollout writes <out_root>/<task>/...; hoist it up one level
+                # so the trial dir itself is the run dir the renderer reads.
+                inner = run_dir
+                for item in inner.iterdir():
+                    dest = trial / item.name
+                    if not dest.exists():
+                        shutil.move(str(item), str(dest))
+                shutil.rmtree(inner, ignore_errors=True)
+                _da_verify_one(task_id, run_dir=trial, dataset=SUBSETS[self.subset].tasks_dir)
+                return trial
+            except Exception as exc:  # noqa: BLE001 - one bad trial must not sink the batch
+                print(f"[wb-da] trial {trial.name} failed: {exc}", flush=True)
+                return None
+
+        with _cf.ThreadPoolExecutor(min(k, 8)) as ex:
+            for got in ex.map(_one, range(k)):
+                if got is not None:
+                    trials.append(got)
+        return trials
 
     def execute(
         self, task_id: str, harness_dir: Path | None, run_id: str, *, timeout: int | None = None
@@ -861,7 +927,11 @@ class WbAdapter:
         return RENDER.body_chars(Path(run_dir), self.subset) >= 200
 
     def trajectory_path(self, run_dir: Path) -> Path:
-        stream = "oc-output.txt" if self.substrate.name == "oc" else "codex-output.jsonl"
+        stream = {
+            "oc": "oc-output.txt",
+            "cx": "codex-output.jsonl",
+            "da": "da-output.jsonl",
+        }[self.substrate.name]
         return Path(run_dir) / "agent" / stream
 
     def trajectory(self, run_dir: Path, *, obs_trunc: int) -> str:
@@ -907,6 +977,21 @@ class WbAdapter:
                         d,
                         stubs=True,
                     )
+                elif self.substrate.name == "da":
+                    from ..substrate.da import DA_SURFACE
+
+                    HT.write_tree(
+                        DA_SURFACE,
+                        {
+                            "AGENTS.md": (
+                                "Follow the task instructions and complete the requested work "
+                                "in the workspace, writing every deliverable where the "
+                                "instructions say."
+                            )
+                        },
+                        d,
+                        stubs=True,
+                    )
                 else:
                     HT.write_tree(
                         CODEX_SURFACE,
@@ -933,6 +1018,14 @@ class WbAdapter:
 
     def preflight(self) -> None:
         """Check the benchmark checkout and executor before starting containers."""
+        if self.substrate.name == "da":
+            # DA drives rollouts on the host through its own HTTP API and runs
+            # the task verifier in docker; no Harbor run.sh or harness config
+            # is needed on this path.
+            self.substrate.preflight()
+            if shutil.which("docker") is None:
+                raise RuntimeError("the DA verifier builds task images with docker")
+            return
         if shutil.which("uv") is None:
             raise RuntimeError(
                 "`uv` is not on PATH; WB batches run as `uv run ./scripts/run.sh` inside "
