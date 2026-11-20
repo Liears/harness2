@@ -653,7 +653,14 @@ def run_batch(
 
 def spec_for(subset: str, substrate: str) -> BenchSpec:
     s = SUBSETS[subset]
-    channel = resolve_channel_model(None, None, effort="high")
+    # A DA executor naturally pairs with the DA proposer channel: the same
+    # service that runs the rollouts also runs the editor sessions, so no
+    # second model endpoint or credential is needed for the improvement loop.
+    # Override via config.DEFAULT_PROPOSER_CHANNEL for a different editor.
+    if substrate == "da":
+        channel = resolve_channel_model("da", config.DA_PROPOSER_MODEL, effort="high")
+    else:
+        channel = resolve_channel_model(None, None, effort="high")
     install_mode = {"oc": "home_dir_jinja", "cx": "codex_root", "da": "workspace_agents_md"}[
         substrate
     ]
