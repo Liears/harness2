@@ -54,6 +54,11 @@ def prepare_workspace(task_dir: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tf:
         tf.extractall(dest, filter="data")
+    # Post-extraction integrity check: the workspace must be a self-consistent
+    # tree before we hand it to the agent. A concurrent run deleting files
+    # mid-extraction used to surface much later as a cryptic git failure.
+    if not (dest / ".gitignore").exists() and not list(dest.iterdir()):
+        raise RuntimeError(f"workspace extraction produced nothing in {dest}")
 
 
 # Files the agent authors while solving that must NOT reach the verifier.
@@ -186,10 +191,18 @@ def run_one(
     (run_dir / "agent").mkdir()
     (run_dir / "verifier").mkdir()
 
-    # A stable per-task path: DA registers host directories as projects keyed
-    # by a filesystem identity that collides for fresh mkdtemp paths (23505
-    # on POST /api/projects), so we reuse one directory per task id instead.
-    workspace = Path(tempfile.gettempdir()) / "da-wb-workspaces" / task_id
+    # Per-rollout workspace path: an earlier stable-path scheme (/tmp/da-wb-
+    # workspaces/<task>) was unique per task but NOT per rollout, so a paired
+    # A/B run of the same task ran two processes on the same directory and
+    # each one's `rm -rf` deleted the other's freshly-extracted files mid-run
+    # (observed: `git add -A` failed with "unable to stat" on files that were
+    # still in the archive). Include the run root's name so distinct arms and
+    # distinct reruns of the same task never share a workspace.
+    workspace = (
+        Path(tempfile.gettempdir())
+        / "da-wb-workspaces"
+        / f"{out_root.name}__{task_id}"
+    )
     if workspace.exists():
         shutil.rmtree(workspace)
     client = DaClient()
