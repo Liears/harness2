@@ -56,20 +56,76 @@ def prepare_workspace(task_dir: Path, dest: Path) -> None:
         tf.extractall(dest, filter="data")
 
 
+# Files the agent authors while solving that must NOT reach the verifier.
+# `tests/**` is the task's answer key: the verifier injects its own tests over
+# that path, so an agent-authored test file is both overwritten and — worse —
+# makes the diff look like the agent edited the graded surface. Scratch edits
+# under these prefixes are dropped from the patch so the score reflects only
+# what the verifier actually sees.
+_NON_DELIVERABLE_PREFIXES = ("tests/", "solution/", "environment/")
+_NON_DELIVERABLE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _is_deliverable(path: str) -> bool:
+    if any(path.startswith(p) for p in _NON_DELIVERABLE_PREFIXES):
+        return False
+    return not path.endswith(_NON_DELIVERABLE_SUFFIXES)
+
+
 def workspace_diff(workspace: Path) -> str:
     """git diff of the agent's work, including untracked files.
 
     The upstream verifier scores a diff against the pristine repo, so the
     patch must carry both modifications and new files. The baseline commit is
     made by ``snapshot_baseline`` BEFORE the agent runs; this function only
-    stages and diffs afterwards.
+    stages and diffs afterwards, then drops hunks on paths the verifier owns
+    (see `_NON_DELIVERABLE_PREFIXES`).
     """
     git = ["git", "-C", str(workspace)]
     status = subprocess.run(git + ["status", "--porcelain"], capture_output=True, text=True)
     if status.stdout.strip():
         subprocess.run(git + ["add", "-A"], check=True)
     diff = subprocess.run(git + ["diff", "HEAD"], capture_output=True, text=True)
-    return diff.stdout
+    return _drop_non_deliverable(diff.stdout)
+
+
+def _drop_non_deliverable(diff_text: str) -> str:
+    """Keep only the file sections whose path the verifier does not own."""
+    if "diff --git " not in diff_text:
+        return diff_text
+    head, *sections = diff_text.split("diff --git ")
+    kept: list[str] = []
+    for section in sections:
+        first = section.split("\n", 1)[0]
+        # `a/<path> b/<path>`; the b-side is authoritative for new files.
+        parts = first.split()
+        path = parts[1][2:] if len(parts) > 1 and parts[1].startswith("b/") else ""
+        if path and _is_deliverable(path):
+            kept.append("diff --git " + section)
+    return head + "".join(kept)
+
+
+def install_harness(harness: Path, workspace: Path) -> None:
+    """Lay a harness tree into the workspace the way DA's loader reads it.
+
+    AGENTS.md goes at the workspace root (DA collects it upward from the
+    session working directory and injects it at the system tail). `skills/` is
+    copied alongside for provenance -- DA's runtime skill surface is its
+    agent_skills table, not this directory, so a skill edit only takes effect
+    once the same package is installed through the DA API.
+    """
+    harness = Path(harness)
+    for entry in sorted(harness.iterdir()):
+        if entry.name == "AGENTS.md":
+            target = workspace / "AGENTS.md"
+            if target.exists():
+                target.unlink()
+            shutil.copy2(entry, target)
+        elif entry.is_dir() and entry.name == "skills":
+            dest = workspace / "skills"
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(entry, dest)
 
 
 def snapshot_baseline(workspace: Path) -> None:
@@ -97,8 +153,20 @@ def snapshot_baseline(workspace: Path) -> None:
     )
 
 
-def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> Path:
+def run_one(
+    task_id: str,
+    *,
+    dataset: Path,
+    out_root: Path,
+    timeout_s: int,
+    harness: Path | None = None,
+) -> Path:
     """One task through DA: workspace -> session -> rollout -> run_dir.
+
+    `harness` is an optional harness tree (the Harness2 c-surface: AGENTS.md and
+    skills/). When given, its files are laid into the workspace before the
+    session starts, so DA's own project-instruction loader picks AGENTS.md up
+    from the system tail. Without it the workspace is the pristine task repo.
 
     The DA session and its transcript are deliberately NOT deleted afterwards:
     deletion cascades agent_tasks away and erases on-disk transcripts mid-batch
@@ -127,6 +195,9 @@ def run_one(task_id: str, *, dataset: Path, out_root: Path, timeout_s: int) -> P
     client = DaClient()
     _log(f"preparing workspace from {task_dir.name}")
     prepare_workspace(task_dir, workspace)
+    if harness is not None:
+        install_harness(harness, workspace)
+        _log(f"harness installed from {harness}: {sorted(p.name for p in harness.iterdir())}")
     snapshot_baseline(workspace)
     _log(f"workspace ready: {workspace}")
 
@@ -187,10 +258,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     p.add_argument("--out", type=Path, default=Path("runs/da-baseline"))
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument(
+        "--harness", type=Path, default=None,
+        help="harness tree (AGENTS.md, skills/) to lay into the workspace before the run",
+    )
     args = p.parse_args(argv)
     try:
         run_dir = run_one(
-            args.task_id, dataset=args.dataset, out_root=args.out, timeout_s=args.timeout
+            args.task_id,
+            dataset=args.dataset,
+            out_root=args.out,
+            timeout_s=args.timeout,
+            harness=args.harness,
         )
     except (FileNotFoundError, DaError) as e:
         print(f"error: {e}", file=sys.stderr)

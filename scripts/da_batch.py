@@ -41,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
     p.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument(
+        "--harness", type=Path, default=None,
+        help="harness tree (AGENTS.md, skills/) laid into every workspace before its run",
+    )
     args = p.parse_args(argv)
 
     task_ids = args.task_ids or pick_tasks(args.dataset, args.n)
@@ -50,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     with cf.ThreadPoolExecutor(args.jobs) as ex:
         futs = {
             ex.submit(run_one, tid, dataset=args.dataset, out_root=args.out,
-                      timeout_s=args.timeout): tid
+                      timeout_s=args.timeout, harness=args.harness): tid
             for tid in task_ids
         }
         for fut in cf.as_completed(futs):
