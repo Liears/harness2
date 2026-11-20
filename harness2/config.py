@@ -173,7 +173,16 @@ WB_MAX_TRIALS = {"oc": 2, "cx": 2}
 WB_MODEL_CONNECTION = "local_proxy"
 
 DEFAULT_PROPOSER_CHANNEL = "opencode"
-PROPOSER_MODEL_BY_CHANNEL = {"opencode": IMPROVER_MODEL, "claude_cli": IMPROVER_MODEL}
+# The `da` channel names DA's own model id (a bare name from the service's
+# provider table, e.g. `deepseek-v41`); it is advisory -- DA resolves the model
+# from its provider table and ignores this for routing. It still has to be a
+# non-empty label because that is the channel contract's shape.
+DA_PROPOSER_MODEL = env("HARNESS2_DA_PROPOSER_MODEL", "da-default")
+PROPOSER_MODEL_BY_CHANNEL = {
+    "opencode": IMPROVER_MODEL,
+    "claude_cli": IMPROVER_MODEL,
+    "da": DA_PROPOSER_MODEL,
+}
 PHASE_WIDTH = 2
 TRANSPORT_ATTEMPTS = 2
 PROPOSER_CONCURRENCY = 2

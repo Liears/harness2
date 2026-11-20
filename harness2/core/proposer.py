@@ -150,9 +150,7 @@ class Proposer:
                 if context_dir and Path(context_dir).is_dir():
                     shutil.copytree(context_dir, tmp / "context", dirs_exist_ok=True)
                 with _SEM if _SEM is not None else contextlib.nullcontext():
-                    text, cost, err = (
-                        self._claude_cli if self.spec.kind == "claude_cli" else self._opencode
-                    )(tmp, mission, system, wall)
+                    text, cost, err = self._run_channel(tmp, mission, system, wall)
                 spent_usd += cost
                 if not text.strip():
                     last = err or "empty reply"
@@ -197,6 +195,48 @@ class Proposer:
             attempts=tries,
             cost_usd=spent_usd,
         )
+
+    def _run_channel(
+        self, tmp: Path, mission: str, system: str, wall: int
+    ) -> tuple[str, float, str]:
+        """Dispatch one session to the configured channel."""
+        if self.spec.kind == "claude_cli":
+            return self._claude_cli(tmp, mission, system, wall)
+        if self.spec.kind == "da":
+            return self._da(tmp, mission, system, wall)
+        return self._opencode(tmp, mission, system, wall)
+
+    def _da(self, cwd: Path, mission: str, system: str, wall: int) -> tuple[str, float, str]:
+        """Drive one DeepAnalyze session whose working directory is `cwd`.
+
+        DA owns the model wiring (its provider table points at whatever endpoint
+        the operator configured), so this channel carries no credentials. The
+        session's file tools edit `context/harness/` in place, which `harvest`
+        then copies back -- the same contract as the opencode channel.
+        """
+        from ..substrate.da import DaClient, DaError
+
+        (cwd / "MISSION.md").write_text(
+            (f"{system}\n\n---\n\n" if system else "") + mission, encoding="utf-8"
+        )
+        instruction = (
+            "Read MISSION.md in your working directory first, then do what it asks. "
+            "Edit the files under `context/harness/` IN PLACE -- do not move or rewrite "
+            "that directory. Reply with the requested output as your final message."
+        )
+        session_title = f"harness2 proposer ({self.spec.model or 'default model'})"
+        try:
+            result = DaClient().session_workspace(
+                cwd, instruction, timeout_s=float(wall), title=session_title
+            )
+        except DaError as e:
+            return "", 0.0, f"da: {e}"
+        text = result.output.strip()
+        if result.status not in ("complete", "completed"):
+            return "", 0.0, f"da session ended {result.status!r} after {result.turns} turns"
+        if not text:
+            return "", 0.0, "da session returned an empty final message"
+        return text, 0.0, ""
 
     def _claude_cli(
         self, cwd: Path, mission: str, system: str, wall: int

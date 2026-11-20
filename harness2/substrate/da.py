@@ -151,35 +151,73 @@ class DaClient:
             raise DaError(f"create_session returned no id: {payload!r}")
         return sid
 
-    def create_project(self, root_path: Path) -> str:
+    def create_project(self, root_path: Path, *, reregister: bool = False) -> str:
         """Register a host directory as a DA project; returns the project id.
 
         Host projects are the single sanctioned way to point a session's
-        workspace at a benchmark task directory (requireHostProjects is on in
-        local mode). Idempotent enough for retries: a duplicate rootPath is
-        rejected by the server as a conflict, which callers may ignore if a
-        lookup by rootPath already returned the id.
+        workspace at a directory (requireHostProjects is on in local mode).
+
+        DA keys a project by filesystem identity (`fs:<dev>:<ino>`), and ext4
+        reuses a just-freed inode for the next directory created in the same
+        parent. A caller that deletes and recreates its working directory can
+        therefore collide with a stale row that `find_project` cannot see (the
+        row points at the same inode but a different path). `reregister=True`
+        makes that recoverable: on the duplicate conflict, look up any row whose
+        canonicalPath matches, remove it, and register again.
         """
-        payload = self._request(
-            "POST", "/api/projects", body={"rootPath": str(root_path.resolve())}
-        )
+        try:
+            payload = self._request(
+                "POST", "/api/projects", body={"rootPath": str(root_path.resolve())}
+            )
+        except DaError as e:
+            if not reregister or "PROJECT_DIRECTORY_REGISTERED" not in str(e):
+                raise
+            stale = self._stale_project_ids(root_path)
+            if not stale:
+                raise
+            for pid in stale:
+                print(f"[da-client] removing stale project {pid} for {root_path}", flush=True)
+                self.remove_project(pid)
+            payload = self._request(
+                "POST", "/api/projects", body={"rootPath": str(root_path.resolve())}
+            )
         pid = payload.get("id") if isinstance(payload, dict) else None
         if not isinstance(pid, str) or not pid:
             raise DaError(f"create_project returned no id: {payload!r}")
         return pid
 
-    def find_project(self, root_path: Path) -> str | None:
+    def _projects(self) -> list[dict]:
         payload = self._request("GET", "/api/projects")
         projects = payload if isinstance(payload, list) else (
             payload.get("projects") if isinstance(payload, dict) else []
         )
+        return [p for p in projects if isinstance(p, dict)] if isinstance(projects, list) else []
+
+    def _stale_project_ids(self, root_path: Path) -> list[str]:
+        """Rows whose canonicalPath is this path's parent-sibling identity match.
+
+        DA does not expose pathKey, so the recoverable signal is the directory
+        the caller is about to (re)use: any row pointing at this exact path, or
+        at a path that no longer exists while holding our inode, is stale.
+        """
         wanted = str(root_path.resolve())
-        if isinstance(projects, list):
-            for p in projects:
-                if isinstance(p, dict) and str(p.get("rootPath") or "") == wanted:
-                    pid = p.get("id")
-                    if isinstance(pid, str) and pid:
-                        return pid
+        out: list[str] = []
+        for p in self._projects():
+            pid = p.get("id")
+            if not isinstance(pid, str) or not pid:
+                continue
+            canonical = str(p.get("canonicalPath") or "")
+            if canonical == wanted:
+                out.append(pid)
+        return out
+
+    def find_project(self, root_path: Path) -> str | None:
+        wanted = str(root_path.resolve())
+        for p in self._projects():
+            if str(p.get("rootPath") or "") == wanted:
+                pid = p.get("id")
+                if isinstance(pid, str) and pid:
+                    return pid
         return None
 
     def remove_project(self, project_id: str) -> None:
@@ -300,6 +338,75 @@ class DaClient:
         except DaError as e:
             print(f"[da-client] ask_user answer failed on {task_id}: {e}", flush=True)
             return False
+
+    def session_workspace(
+        self, working_dir: Path, instruction: str, *, timeout_s: float, title: str = "harness2 proposer"
+    ) -> DaRolloutResult:
+        """Run ONE agentic session whose working directory is `working_dir`.
+
+        This is the proposer/selector channel: the caller has already laid out
+        the evidence and the harness tree under `working_dir`, the session's
+        file tools act on it in place, and the final answer comes back as the
+        run's output. Unlike a benchmark rollout there is no transcript guard
+        here -- an unattended edit session that asks a question is a real
+        failure the caller should see, not something to paper over.
+        """
+        working_dir = Path(working_dir).resolve()
+        project_id = self.find_project(working_dir) or self.create_project(
+            working_dir, reregister=True
+        )
+        session_id = self.create_session(title)
+        try:
+            self.bind_workspace(session_id, project_id)
+        except DaError as e:
+            if "PROJECT_DIRECTORY_CHANGED" not in str(e):
+                raise
+            # The session dir is rebuilt between runs, so the project row's
+            # filesystem identity is stale; re-register and bind again.
+            self.remove_project(project_id)
+            project_id = self.create_project(working_dir)
+            self.bind_workspace(session_id, project_id)
+        task_id = self.run_async(session_id, instruction)
+        result = self.wait_for_task(task_id, timeout_s=timeout_s)
+        if result.output.strip():
+            return result
+        # DA's `finish` tool carries the answer as the tool call's `summary`;
+        # the task status `output` stays empty for that ending shape. Recover
+        # the answer from the transcript so a session that ends by calling
+        # finish is not mistaken for one that returned nothing.
+        final = self.final_answer(session_id)
+        return DaRolloutResult(status=result.status, output=final, turns=result.turns)
+
+    def final_answer(self, session_id: str) -> str:
+        """The last `finish` summary in the session, else the last assistant text."""
+        try:
+            entries = self.transcript(session_id)
+        except DaError:
+            return ""
+        for entry in reversed(entries):
+            if entry.get("type") == "tool_result" and entry.get("toolName") == "finish":
+                raw = entry.get("output")
+                if isinstance(raw, str):
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict):
+                        summary = payload.get("summary")
+                        if isinstance(summary, str) and summary.strip():
+                            return summary.strip()
+                    if raw.strip():
+                        return raw.strip()
+                elif isinstance(raw, dict):
+                    summary = raw.get("summary")
+                    if isinstance(summary, str) and summary.strip():
+                        return summary.strip()
+        for entry in reversed(entries):
+            if entry.get("type") == "assistant":
+                text = entry.get("content")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        return ""
 
 
 def render_events(

@@ -30,7 +30,11 @@ from .tree import SurfaceSpec
 
 ModelId = str
 
-CHANNELS = ("claude_cli", "opencode")
+# A channel is how a proposer/selector session is driven. `da` drives a
+# DeepAnalyze service over its HTTP API: the session is a DA project bound to
+# the session's working directory, so the editor's file tools act directly on
+# `context/` and the edited `context/harness/`.
+CHANNELS = ("claude_cli", "opencode", "da")
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,14 @@ def resolve_channel_model(
         raise ValueError(
             f"claude_cli channel takes a bare Anthropic id "
             f"(e.g. {config.PROPOSER_MODEL_BY_CHANNEL['claude_cli']!r}), got {model!r}"
+        )
+    if kind == "da" and "/" in model:
+        # DA resolves the model from its own provider table; a provider-prefixed
+        # id here would silently reach the wrong route. A bare id is the DA-side
+        # model name (or empty, meaning "whatever DA's main default is").
+        raise ValueError(
+            f"da channel takes DA's own bare model id or an empty string "
+            f"(the service resolves it), got {model!r}"
         )
     return ChannelSpec(kind, model, effort=effort, steps=steps, timeout=timeout)
 
