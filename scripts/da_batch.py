@@ -64,8 +64,26 @@ def main(argv: list[str] | None = None) -> int:
                 results[tid] = {"run_dir": str(run_dir), "ok": True}
                 print(f"[batch] rollout done: {tid}", flush=True)
             except Exception as e:  # noqa: BLE001 - batch must survive one bad task
-                results[tid] = {"ok": False, "error": str(e)[:300]}
-                print(f"[batch] rollout FAILED: {tid}: {e}", flush=True)
+                # Infrastructure failures (queue timeout, provider timeout,
+                # transport error) are NOT model failures: they mean "this
+                # trial never happened", not "the agent scored 0". Mark them
+                # unscored so the A/B comparison only covers real outcomes.
+                msg = str(e)
+                infra = any(
+                    k in msg for k in (
+                        "did not reach a terminal state",
+                        "connection timeout",
+                        "排队超时",
+                        "ConnectionError",
+                        "TimeoutError",
+                    )
+                )
+                results[tid] = {
+                    "ok": False,
+                    "infra_failure": infra,
+                    "error": msg[:300],
+                }
+                print(f"[batch] rollout {'INFRA-FAIL' if infra else 'FAILED'}: {tid}: {msg[:150]}", flush=True)
 
     from scripts.da_verify import verify_one
 
@@ -82,13 +100,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[batch] judge FAILED: {tid}: {e}", flush=True)
 
     scored = [r.get("score") for r in results.values() if r.get("score") is not None]
+    infra = sum(1 for r in results.values() if r.get("infra_failure"))
     print("\n=== summary ===")
     for tid in task_ids:
         r = results[tid]
         mark = r.get("score")
-        print(f"{tid:55s} {'FAILED' if not r['ok'] else ('unscored' if mark is None else f'{mark:.3f}')}")
+        label = (
+            "INFRA-FAIL" if r.get("infra_failure")
+            else "FAILED" if not r["ok"]
+            else "unscored" if mark is None
+            else f"{mark:.3f}"
+        )
+        print(f"{tid:55s} {label}")
     if scored:
-        print(f"\nmean={sum(scored) / len(scored):.3f}  scored={len(scored)}/{len(task_ids)}")
+        print(f"\nmean={sum(scored) / len(scored):.3f}  scored={len(scored)}/{len(task_ids)}"
+              + (f"  infra-failures={infra}" if infra else ""))
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "summary.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
